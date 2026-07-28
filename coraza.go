@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -138,16 +140,105 @@ func (m *corazaModule) buildWAF() (coraza.WAF, error) {
 // computePoolKey returns a deterministic key derived from the configuration
 // fields that affect WAF construction. Two modules with identical configs
 // will produce the same key, enabling WAF reuse across reloads.
+// includeRe matches an Include directive in a SecLang rule set. The path may
+// be quoted and may contain a glob pattern.
+var includeRe = regexp.MustCompile(`(?mi)^[ \t]*Include[ \t]+"?([^"\r\n]+?)"?[ \t]*$`)
+
+// maxIncludeDepth bounds recursive expansion so that a rule file including
+// itself, directly or transitively, cannot loop forever.
+const maxIncludeDepth = 8
+
+// stripNoise removes what does not affect the effective rule set: comment-only
+// lines and blank lines.
+//
+// Without it, two functionally identical exclusion files whose header comment
+// mentions a different host ("# exclusions for a.example.com" vs
+// "# exclusions for b.example.com") would still hash differently, and each
+// site would get its own WAF instance for an identical configuration. Coraza
+// ignores those lines; the pool key should too.
+//
+// Only whole-line comments are dropped: a '#' inside a rule belongs to the
+// rule and must be taken into account.
+func stripNoise(s string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		b.WriteString(t)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// expandIncludes replaces every Include directive with the CONTENT of the
+// files it designates, recursively.
+//
+// The result is never handed to Coraza: it only feeds the pool key. The goal
+// is for that key to describe the rules that are actually loaded, rather than
+// where they happen to live. Two consequences:
+//
+//   - editing an included file changes the key, so the WAF is rebuilt instead
+//     of being served from the pool with its previously compiled rules.
+//     Without this, the change is silently ignored, even with
+//     `caddy reload --force`;
+//   - two configurations pointing at different paths whose contents are
+//     identical produce the same key and therefore share one instance. This is
+//     the common case of one exclusion file per site, empty or reduced to
+//     comments: without normalisation each site pays for a full instance —
+//     CRS rules included — for a configuration identical to its neighbour's.
+//
+// A missing or unreadable file is replaced by a marker holding its path: the
+// key stays deterministic, and the error is reported later by WAF
+// construction rather than here.
+func expandIncludes(directives string, depth int) string {
+	if depth > maxIncludeDepth {
+		return directives
+	}
+	return includeRe.ReplaceAllStringFunc(directives, func(line string) string {
+		m := includeRe.FindStringSubmatch(line)
+		if m == nil {
+			return line
+		}
+		pattern := strings.TrimSpace(m[1])
+
+		files, err := filepath.Glob(pattern)
+		if err != nil || len(files) == 0 {
+			return "\x00missing:" + pattern + "\x00"
+		}
+		// Explicit sort: Glob follows filesystem order, which is not
+		// guaranteed to be stable across restarts.
+		sort.Strings(files)
+
+		var b strings.Builder
+		for _, f := range files {
+			content, err := os.ReadFile(f)
+			if err != nil {
+				b.WriteString("\x00unreadable:" + f + "\x00")
+				continue
+			}
+			b.Write(content)
+			b.WriteByte('\n')
+		}
+		return expandIncludes(b.String(), depth+1)
+	})
+}
+
 func (m *corazaModule) computePoolKey() string {
 	h := sha256.New()
-	h.Write([]byte(m.Directives))
+
+	// The key describes the EFFECTIVE configuration: Include directives are
+	// replaced by file contents, so that two sites with different paths but
+	// identical rules share one instance, and an edited file is detected.
+	h.Write([]byte(stripNoise(expandIncludes(m.Directives, 0))))
 	h.Write([]byte{0}) // separator
 
 	sorted := make([]string, len(m.Include))
 	copy(sorted, m.Include)
 	sort.Strings(sorted)
 	for _, inc := range sorted {
-		h.Write([]byte(inc))
+		h.Write([]byte(stripNoise(expandIncludes("Include "+inc, 0))))
 		h.Write([]byte{0})
 	}
 
