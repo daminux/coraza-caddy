@@ -60,6 +60,18 @@ func TestRedactErrorLog_HeaderAndCookie(t *testing.T) {
 	}
 }
 
+func TestRedactErrorLog_ExtraMatchSegments(t *testing.T) {
+	// Regle a plusieurs correspondances : Coraza ajoute [msg_match_N] et
+	// [data_match_N]. Cas reel (T20) : corps JSON lu comme nom de parametre.
+	in := `[id "942100"] [msg "SQL Injection"] [data "Matched Data: s&1c found within ARGS:x: y"] ` +
+		`[msg_match_1 "SQL Injection"] [data_match_1 "Matched Data: 1c found within ARGS:{\"login\":\"bob\",\"password\":\"` + secretPwd + `' OR 1: 1--\"}"] [uri "/api/login"]`
+	out := redactErrorLog(in)
+	assertNoSecret(t, out, secretPwd)
+	if !strings.Contains(out, "[data_match_1 ") || !strings.Contains(out, `[id "942100"]`) {
+		t.Errorf("structure perdue : %s", out)
+	}
+}
+
 func TestRedactErrorLog_NonSensitiveUntouched(t *testing.T) {
 	// Le diagnostic des faux positifs repose sur la donnee reconnue : on ne
 	// masque que ce qui est sensible.
