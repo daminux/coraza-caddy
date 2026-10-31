@@ -42,7 +42,10 @@ var sensitiveHeaders = map[string]bool{
 }
 
 var (
-	reDataSeg = regexp.MustCompile(`\[data "((?:[^"\\]|\\.)*)"\]`)
+	// Segments de ErrorLog() qui peuvent porter une valeur : la donnee reconnue
+	// et le message, plus leurs variantes _match_N quand une regle a plusieurs
+	// correspondances (corazarules.writeExtraRuleDetails).
+	reDataSeg = regexp.MustCompile(`\[((?:data|msg)(?:_match_\d+)?) "((?:[^"\\]|\\.)*)"\]`)
 	reURISeg  = regexp.MustCompile(`\[uri "((?:[^"\\]|\\.)*)"\]`)
 	reColl    = regexp.MustCompile(`^[A-Z_]+`)
 )
@@ -68,8 +71,8 @@ func (redactedJSONFormatter) MIME() string { return "application/json; charset=u
 // redactErrorLog masque une ligne de regle au format Coraza ErrorLog().
 func redactErrorLog(s string) string {
 	s = reDataSeg.ReplaceAllStringFunc(s, func(seg string) string {
-		inner := reDataSeg.FindStringSubmatch(seg)[1]
-		return `[data "` + redactMatchedData(inner) + `"]`
+		m := reDataSeg.FindStringSubmatch(seg)
+		return `[` + m[1] + ` "` + redactMatchedData(m[2]) + `"]`
 	})
 	return reURISeg.ReplaceAllStringFunc(s, func(seg string) string {
 		inner := reURISeg.FindStringSubmatch(seg)[1]
@@ -219,9 +222,14 @@ func redactAuditJSON(raw []byte) ([]byte, error) {
 			if e, ok := mm["error_message"].(string); ok {
 				mm["error_message"] = redactErrorLog(e)
 			}
+			if s, ok := mm["message"].(string); ok {
+				mm["message"] = redactMatchedData(s)
+			}
 			if d, ok := mm["data"].(map[string]any); ok {
-				if s, ok := d["data"].(string); ok {
-					d["data"] = redactMatchedData(s)
+				for _, k := range []string{"data", "msg"} {
+					if s, ok := d[k].(string); ok {
+						d[k] = redactMatchedData(s)
+					}
 				}
 			}
 		}
