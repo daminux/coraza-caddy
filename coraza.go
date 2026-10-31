@@ -297,7 +297,7 @@ func (m corazaModule) ServeHTTP(w http.ResponseWriter, r *http.Request, next cad
 	} else if it != nil {
 		m.logger.Error("WAF rule violation detected",
 			zap.String("hostname", r.Host),
-			zap.String("uri", r.RequestURI),
+			zap.String("uri", redactURI(r.RequestURI)),
 			zap.String("client_ip", r.RemoteAddr),
 			zap.String("unique_id", tx.ID()),
 		)
@@ -367,7 +367,9 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 
 func newErrorCb(logger *zap.Logger) func(types.MatchedRule) {
 	return func(mr types.MatchedRule) {
-		logMsg := mr.ErrorLog()
+		// Masque avant ecriture : ces lignes partent dans les logs du conteneur
+		// et portent la donnee reconnue (cf. redact.go).
+		logMsg := redactErrorLog(mr.ErrorLog())
 		switch mr.Rule().Severity() {
 		case types.RuleSeverityEmergency,
 			types.RuleSeverityAlert,
